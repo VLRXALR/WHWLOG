@@ -1,0 +1,187 @@
+import os
+import sqlite3
+import json
+import shutil
+import sys
+import ctypes
+from ctypes import wintypes
+import base64
+import re
+from datetime import datetime
+
+def get_chrome_cookies(domain_filter=None, name_filter=None):
+    # Путь к cookies Chrome
+    user_data_path = os.path.join(os.environ['LOCALAPPDATA'], 'Google', 'Chrome', 'User Data')
+    cookie_path = os.path.join(user_data_path, 'Default', 'Network', 'Cookies')
+    
+    # Если файл не найден, попробуем найти активный профиль
+    if not os.path.exists(cookie_path):
+        profiles = [d for d in os.listdir(user_data_path) 
+                   if re.match(r'Profile \d+', d) or d == 'System Profile']
+        
+        for profile in profiles:
+            test_path = os.path.join(user_data_path, profile, 'Network', 'Cookies')
+            if os.path.exists(test_path):
+                cookie_path = test_path
+                break
+    
+    temp_db = os.path.join(os.environ['TEMP'], 'chrome_cookies.db')
+    
+    # Копируем файл cookie
+    try:
+        shutil.copy2(cookie_path, temp_db)
+    except Exception as e:
+        print(f"Ошибка копирования файла: {e}")
+        print("Убедитесь, что Chrome закрыт!")
+        return []
+
+    # Подключаемся к БД
+    conn = sqlite3.connect(temp_db)
+    cursor = conn.cursor()
+    
+    # Формируем запрос с фильтрами
+    query = """
+        SELECT host_key, name, value, path, expires_utc, is_secure, is_httponly 
+        FROM cookies
+    """
+    
+    params = []
+    if domain_filter or name_filter:
+        query += " WHERE "
+        conditions = []
+        
+        if domain_filter:
+            conditions.append("host_key LIKE ?")
+            params.append(f"%{domain_filter}%")
+        
+        if name_filter:
+            conditions.append("name LIKE ?")
+            params.append(f"%{name_filter}%")
+        
+        query += " AND ".join(conditions)
+    
+    cursor.execute(query, params)
+
+    # Настройка для дешифровки через Windows API
+    crypt32 = ctypes.WinDLL('crypt32.dll')
+    DATA_BLOB = ctypes.Structure
+    
+    class DATA_BLOB(DATA_BLOB):
+        _fields_ = [
+            ('cbData', wintypes.DWORD),
+            ('pbData', ctypes.POINTER(ctypes.c_char))
+        ]
+
+    cookies = []
+    for row in cursor.fetchall():
+        encrypted_data = row[2]
+        if not encrypted_data:
+            continue
+            
+        try:
+            # Подготовка BLOB-структур
+            data_in = DATA_BLOB()
+            data_in.cbData = len(encrypted_data)
+            data_in.pbData = ctypes.cast(ctypes.create_string_buffer(encrypted_data), ctypes.POINTER(ctypes.c_char))
+            
+            data_out = DATA_BLOB()
+            description = ctypes.c_wchar_p()
+            
+            # Вызов CryptUnprotectData
+            if crypt32.CryptUnprotectData(
+                ctypes.byref(data_in),        # pDataIn
+                ctypes.byref(description),     # ppszDataDescr
+                None,                          # pOptionalEntropy
+                None,                          # pvReserved
+                None,                          # pPromptStruct
+                0,                             # dwFlags
+                ctypes.byref(data_out)         # pDataOut
+            ):
+                # Получение дешифрованных данных
+                decrypted_bytes = ctypes.string_at(data_out.pbData, data_out.cbData)
+                
+                try:
+                    decrypted_value = decrypted_bytes.decode('utf-8')
+                    
+                    # Конвертация времени (Windows FILETIME в Unix timestamp)
+                    expires = row[4]
+                    if expires > 0:
+                        expires = (expires - 11644473600000000) // 1000000
+                    else:
+                        expires = 0
+                    
+                    cookies.append({
+                        'domain': row[0],
+                        'name': row[1],
+                        'value': decrypted_value,
+                        'path': row[3],
+                        'expires': expires,
+                        'expires_utc': row[4],
+                        'secure': bool(row[5]),
+                        'httponly': bool(row[6])
+                    })
+                except UnicodeDecodeError:
+                    # Пробуем декодировать как base64
+                    try:
+                        base64_value = base64.b64encode(decrypted_bytes).decode('utf-8')
+                        cookies.append({
+                            'domain': row[0],
+                            'name': row[1],
+                            'value': f"(binary) base64:{base64_value}",
+                            'path': row[3],
+                            'expires': expires,
+                            'expires_utc': row[4],
+                            'secure': bool(row[5]),
+                            'httponly': bool(row[6])
+                        })
+                    except:
+                        continue
+                finally:
+                    # Освобождение памяти
+                    ctypes.windll.kernel32.LocalFree(data_out.pbData)
+            else:
+                # Ошибка дешифровки
+                error_code = ctypes.windll.kernel32.GetLastError()
+                print(f"Ошибка дешифровки: код {error_code}")
+                continue
+        except Exception as e:
+            print(f"Ошибка обработки cookie: {e}")
+            continue
+
+    conn.close()
+    try:
+        os.remove(temp_db)
+    except:
+        pass
+        
+    return cookies
+
+if __name__ == '__main__':
+    # Пример фильтрации по домену и имени cookie
+    target_domain = input("Введите домен для фильтрации (оставьте пустым для всех): ") or None
+    target_name = input("Введите имя cookie для фильтрации (оставьте пустым для всех): ") or None
+    
+    all_cookies = get_chrome_cookies(domain_filter=target_domain, name_filter=target_name)
+    
+    if not all_cookies:
+        print("Не найдено cookies. Возможные причины:")
+        print("1. Chrome не закрыт")
+        print("2. Нет cookies для указанного фильтра")
+        print("3. Проблема с доступом к файлу cookies")
+        print("4. Ошибка дешифровки")
+    else:
+        # Сохраняем в JSON
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'chrome_cookies_{timestamp}.json'
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(all_cookies, f, ensure_ascii=False, indent=4)
+        
+        print(f"\nИзвлечено {len(all_cookies)} cookies:")
+        for cookie in all_cookies[:5]:  # Показываем первые 5
+            print(f"{cookie['domain']} | {cookie['name']} = {cookie['value'][:50]}...")
+        
+        if len(all_cookies) > 5:
+            print(f"... и еще {len(all_cookies) - 5} cookies")
+        
+        print(f"\nПолные данные сохранены в {filename}")
